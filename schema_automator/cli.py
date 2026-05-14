@@ -16,7 +16,8 @@ import yaml
 from linkml_runtime.linkml_model import SchemaDefinition
 from oaklib.selector import get_implementation_from_shorthand
 
-from schema_automator import JsonLdAnnotator, FrictionlessImportEngine
+from schema_automator.annotators.jsonld_annotator import JsonLdAnnotator
+from schema_automator.importers.frictionless_import_engine import FrictionlessImportEngine
 from schema_automator.annotators import llm_annotator
 from schema_automator.annotators.schema_annotator import SchemaAnnotator
 from schema_automator.generalizers.csv_data_generalizer import CsvDataGeneralizer
@@ -31,7 +32,6 @@ from schema_automator.importers.owl_import_engine import OwlImportEngine
 from schema_automator.generalizers.rdf_data_generalizer import RdfDataGeneralizer
 from schema_automator.importers.rdfs_import_engine import RdfsImportEngine
 from schema_automator.importers.sql_import_engine import SqlImportEngine
-from schema_automator.importers.tabular_import_engine import TableImportEngine
 from schema_automator.importers.xsd_import_engine import XsdImportEngine
 from schema_automator.utils.schemautils import write_schema
 from schema_automator import __version__
@@ -267,40 +267,6 @@ def import_sql(db, output, **args):
 
 
 @main.command()
-@output_option
-@schema_name_option
-@click.option('--class-name', '-c', default=DEFAULT_CLASS_NAME, help='Core class name in schema')
-@click.option('--data-output', help='Path to file of downloaded data')
-@click.option('--element-type', help='E.g. class, enum')
-@click.option('--parent', help='parent ID')
-@click.option('--columns',
-              required=True,
-              help='comma-separated schemasheets descriptors of each column. Must be in same order')
-@click.option('--table-number',
-              type=int,
-              default=0,
-              show_default=True,
-              help='If URL has multiple tables, use this one (zero-based)')
-@click.argument('url')  # input TSV (must have column headers
-def import_htmltable(url, output, class_name, schema_name, columns,
-                         table_number: int, data_output,
-                         **kwargs):
-    """
-    Imports from a table parsed from a URL using SchemaSheets
-
-    Uses pandas/beautiful soup
-    """
-    dfs = pd.read_html(url)
-    logging.info(f"{url} has {len(dfs)} tables")
-    df = dfs[table_number]
-    if data_output:
-        df.to_csv(data_output, index=False, sep="\t")
-    ie = TableImportEngine(columns=columns.split(","), **kwargs)
-    schema = ie.import_from_dataframe(df)
-    write_schema(schema, output)
-
-
-@main.command()
 @click.argument('input')
 @output_option
 @schema_name_option
@@ -408,7 +374,7 @@ def import_kwalify(input, output, schema_name, **kwargs):
         ``schemauto import-kwalify my/schema/personinfo.kwalify.yaml``
     """
     ie = KwalifyImportEngine(**kwargs)
-    schema = ie.convert(input, output, name=schema_name, format=format)
+    schema = ie.convert(input, name=schema_name)
     write_schema(schema, output)
 
 @main.command()
@@ -681,6 +647,119 @@ def annotate_using_jsonld(schema: str, output: str, **args):
     schemadef = SchemaDefinition(schema)
     annr.annotate_schema(schemadef)
     write_schema(schemadef, output)
+
+
+@main.command()
+@click.argument('input_path', metavar='INPUT')
+@output_option
+@click.option(
+    '--reverse/--no-reverse',
+    default=False,
+    help='Reverse direction: read a canonical DD and emit a Frictionless Table Schema. Default reads Frictionless and emits DD.',
+)
+@click.option(
+    '--from-package/--from-schema',
+    default=False,
+    help='Treat input as a full Frictionless Data Package (datapackage.json) and extract the first resource\'s schema. Default treats input as a standalone Table Schema.',
+)
+def adapt_frictionless(input_path: str, output: str, reverse: bool, from_package: bool):
+    """
+    Translate between Frictionless Table Schema and the canonical
+    schema-automator data dictionary format.
+
+    INPUT is a path to a JSON or YAML file. By default the input is a
+    Frictionless Table Schema and the output is a canonical data
+    dictionary (YAML). With --reverse, the input is a data dictionary
+    and the output is a Frictionless Table Schema (JSON).
+    """
+    import json
+    from schema_automator.adapters.frictionless import (
+        dd_to_frictionless,
+        frictionless_to_dd,
+    )
+
+    with open(input_path) as f:
+        data = yaml.safe_load(f)
+
+    if from_package and not reverse:
+        resources = data.get('resources') or []
+        if not resources:
+            raise click.ClickException(f'No resources found in package {input_path}')
+        data = resources[0].get('schema')
+        if not data:
+            raise click.ClickException(
+                f'First resource in {input_path} has no schema block'
+            )
+
+    if reverse:
+        result = dd_to_frictionless(data)
+        out_text = json.dumps(result, indent=2)
+    else:
+        result = frictionless_to_dd(data)
+        out_text = yaml.safe_dump(result, sort_keys=False, allow_unicode=True)
+
+    if output:
+        with open(output, 'w') as f:
+            f.write(out_text)
+    else:
+        click.echo(out_text)
+
+
+@main.command()
+@click.argument('data_dict_path', metavar='DATA_DICT_XML')
+@click.option(
+    '--var-report',
+    'var_report_path',
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help='Optional path to the matching var_report.xml. Provides empirical min/max for numeric variables and the calculated_type fallback used when the data_dict <type> element is empty or ambiguous.',
+)
+@output_option
+@click.option(
+    '--tsv/--yaml',
+    default=False,
+    help='Output format. Default is YAML (lossless structured codes). --tsv emits the canonical DD TSV serialization grammar.',
+)
+def adapt_dbgap(data_dict_path: str, var_report_path: str | None, output: str, tsv: bool):
+    """
+    Translate a dbGaP variable digest (data_dict.xml, optionally with the
+    matching var_report.xml) into the canonical schema-automator data
+    dictionary format.
+
+    DATA_DICT_XML is the path to a dbGaP *.data_dict.xml file. The
+    optional --var-report enriches the output with empirical signals
+    (numeric min/max, calculated_type fallback). Output defaults to
+    YAML on stdout; --tsv emits the canonical TSV serialization;
+    -o writes to a file.
+    """
+    from schema_automator.adapters.codes import serialize_codes
+    from schema_automator.adapters.dbgap import dbgap_to_dd
+
+    dd = dbgap_to_dd(data_dict_path, var_report_path)
+
+    if tsv:
+        columns = [
+            'name', 'type', 'description', 'codes',
+            'unit', 'min', 'max', 'uri',
+        ]
+        lines = ['\t'.join(columns)]
+        for entry in dd.get('entries', []):
+            row = []
+            for col in columns:
+                v = entry.get(col, '')
+                if col == 'codes' and isinstance(v, list):
+                    v = serialize_codes(v)
+                row.append(str(v) if v is not None else '')
+            lines.append('\t'.join(row))
+        out_text = '\n'.join(lines) + '\n'
+    else:
+        out_text = yaml.safe_dump(dd, sort_keys=False, allow_unicode=True)
+
+    if output:
+        with open(output, 'w') as f:
+            f.write(out_text)
+    else:
+        click.echo(out_text)
 
 
 if __name__ == "__main__":
